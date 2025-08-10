@@ -16,7 +16,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_api_key_here")
 MODEL_NAME = "gemini-2.5-flash"
 
 # This now acts as a secondary, technical limit. The primary limit is in the prompt.
-MAX_RESPONSE_TOKENS = 250
 
 # The prompt template is now the primary method of control.
 PROMPT_TEMPLATE = """
@@ -117,7 +116,6 @@ def chat_endpoint():
         # This allows the model to spend more time on complex prompts to improve accuracy.
         # You can adjust the budget (0 to 24576) or remove this config entirely.
         generation_config = genai.GenerationConfig(
-            max_output_tokens=MAX_RESPONSE_TOKENS,
             temperature=0.7,
             # thinking_config=genai.types.ThinkingConfig(
             #     thinking_budget=1024  # Example budget, can be adjusted
