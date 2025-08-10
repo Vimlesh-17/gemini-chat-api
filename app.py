@@ -65,7 +65,11 @@ class ChatSession:
         self.history = []
         self.created_at = datetime.now()
         self.last_used = datetime.now()
-        self.chat = model.start_chat(history=[])
+        # Pass system prompt directly to start_chat
+        self.chat = model.start_chat(
+            history=[],
+            enable_automatic_function_calling=True
+        )
     
     def add_message(self, role, parts):
         self.history.append({"role": role, "content": parts, "timestamp": time.time()})
@@ -106,6 +110,7 @@ def extract_response_text(response):
         return "I'm sorry, I couldn't generate a response for that query."
 
 @app.route('/chat', methods=['POST'])
+@app.route('/chat', methods=['POST'])
 def chat_endpoint():
     data = request.json
     query = data.get('query')
@@ -116,10 +121,23 @@ def chat_endpoint():
     
     try:
         session = get_session(session_id)
-        session.add_message("user", query)
         
+        # Add user's message to history FIRST
+        session.add_message("user", query)
+
+        # Combine chat history and the new query to send to the model
+        full_history = session.get_gemini_history()
+        
+        # Create a generation config for this specific call
+        generation_config = genai.GenerationConfig(
+            max_output_tokens=MAX_RESPONSE_TOKENS
+        )
+
         # Generate response
-        response = session.chat.send_message(query)
+        response = session.chat.send_message(
+            query,
+            generation_config=generation_config
+        )
         answer = extract_response_text(response)
         
         session.add_message("model", answer)
@@ -137,7 +155,8 @@ def chat_endpoint():
             "error": str(e),
             "session_id": session_id
         }), 500
-
+    
+    
 def cleanup_old_sessions(max_age_seconds=3600, max_sessions=50):
     now = datetime.now()
     expired_keys = [
