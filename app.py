@@ -15,8 +15,7 @@ MODEL_NAME = "gemini-1.5-flash"
 # This now acts as a secondary, technical limit. The primary limit is in the prompt.
 MAX_RESPONSE_TOKENS = 250 
 
-# We will now embed the prompt directly into each query.
-# The SYSTEM_PROMPT variable is no longer used for model initialization.
+# The prompt template is now the primary method of control.
 PROMPT_TEMPLATE = """
 **INSTRUCTIONS:**
 You are a mature, non-judgmental friend/Psychologist for teenagers.
@@ -29,12 +28,11 @@ You MUST reply in 2-3 short sentences or a few bullet points.
 """
 
 # --- Model Initialization ---
-# The model is now initialized WITHOUT a system_instruction.
+# The model is initialized without a system_instruction.
 genai.configure(api_key=GEMINI_API_KEY)
 
 model = genai.GenerativeModel(
     MODEL_NAME,
-    # The system_instruction parameter has been removed.
     safety_settings={
         'HATE': 'BLOCK_NONE',
         'HARASSMENT': 'BLOCK_NONE',
@@ -58,9 +56,6 @@ class ChatSession:
         self.last_used = datetime.now()
     
     def get_gemini_history(self):
-        # We now need to ensure the history sent to the API is structured correctly,
-        # especially for the first message which won't have a model response yet.
-        # The generate_content function handles this well.
         return self.history
 
 # --- Session Management ---
@@ -90,7 +85,7 @@ def extract_response_text(response):
             return "I'm sorry, I encountered an error while generating a response."
     return "I am unable to provide a response at this time."
 
-# --- HEAVILY REVISED Chat Endpoint ---
+# --- Chat Endpoint (with updated response JSON) ---
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
     data = request.json
@@ -103,30 +98,24 @@ def chat_endpoint():
     try:
         session = get_session(session_id)
         
-        # 1. CONSTRUCT THE FINAL PROMPT
-        # We merge our instructions and the user's query into a single prompt.
+        # Construct the final prompt by merging the template and the user's query.
         final_prompt_for_api = PROMPT_TEMPLATE.format(user_query=query)
 
-        # 2. ADD CLEAN MESSAGES TO HISTORY
-        # We add the *original* user query to the history for a clean conversation log.
+        # Add the original, clean user query to the history.
         session.add_message("user", query)
         
-        # We create a temporary history copy to send to the API.
         history_for_api = list(session.get_gemini_history())
 
-        # Now, we REPLACE the last user message with our combined, forceful prompt.
-        # This ensures the API sees the instructions for the current turn.
+        # Replace the last user message with our combined, forceful prompt for the API call.
         history_for_api[-1]['parts'] = [final_prompt_for_api]
 
-        # 3. DEFINE GENERATION CONFIG
-        # This acts as a final technical safeguard.
+        # Define generation config as a technical safeguard.
         generation_config = genai.GenerationConfig(
             max_output_tokens=MAX_RESPONSE_TOKENS,
             temperature=0.7
         )
 
-        # 4. GENERATE CONTENT
-        # We send the modified history to the model.
+        # Generate the response using the modified history.
         response = model.generate_content(
             history_for_api,
             generation_config=generation_config
@@ -134,13 +123,15 @@ def chat_endpoint():
         
         answer = extract_response_text(response)
         
-        # 5. ADD CLEAN RESPONSE TO HISTORY
-        # We add only the model's actual answer to our persistent session history.
+        # Add the clean model response to the persistent session history.
         session.add_message("model", answer)
         
         cleanup_old_sessions()
         
+        # *** MODIFICATION IS HERE ***
+        # The original 'query' is now included in the JSON response.
         return jsonify({
+            "query": query, # Added this line
             "response": answer,
             "session_id": session.id,
             "model": MODEL_NAME,
