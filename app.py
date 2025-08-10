@@ -7,41 +7,24 @@ import time
 from datetime import datetime
 
 app = Flask(__name__)
-CORS(app)  # It's recommended to specify domains in production, e.g., CORS(app, resources={r"/chat": {"origins": "https://your-frontend-domain.com"}})
+CORS(app)
 
 # --- Configuration ---
-# It's best practice to load the API key from environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_api_key_here") 
 MODEL_NAME = "gemini-1.5-flash" 
-MAX_RESPONSE_TOKENS = 100 # This will be strictly enforced now
+MAX_RESPONSE_TOKENS = 80 # Lowered slightly to be even more strict
 
 # The system prompt that defines the AI's persona and rules.
 SYSTEM_PROMPT = """
 You are a mature, non-judgmental friend/Psychologist for teenagers. Provide helpful, honest advice on any topic while maintaining appropriate boundaries. Strictly reply in 2 to 3 sentences or bullet points no more than that!.
-
-Guidelines:
-1. Always respond in a friendly, conversational tone using simple language
-2. For sensitive topics:
-   - Offer thoughtful guidance without graphic details
-   - Suggest consulting trusted adults when appropriate
-3. Structure responses clearly:
-   • Use bullet points for multiple ideas
-   • Add line breaks between concepts
-4. Never say "I can't answer that" - instead:
-   - Rephrase sensitive topics positively
-   - Focus on general principles
-   - Redirect to appropriate resources
 """
 
 # --- Model Initialization ---
-# Configure the Gemini client
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Initialize the model with the system prompt. This prompt sets the base context.
 model = genai.GenerativeModel(
     MODEL_NAME,
     system_instruction=SYSTEM_PROMPT,
-    # Safety settings are adjusted to be less restrictive.
     safety_settings={
         'HATE': 'BLOCK_NONE',
         'HARASSMENT': 'BLOCK_NONE',
@@ -53,34 +36,28 @@ model = genai.GenerativeModel(
 # --- In-Memory Session Storage ---
 sessions = {}
 
-# --- UPDATED ChatSession Class ---
-# This class is now simplified to only manage history, not a stateful chat object.
+# --- ChatSession Class ---
 class ChatSession:
     def __init__(self, session_id):
         self.id = session_id
-        self.history = []  # Manually managed history
+        self.history = []
         self.created_at = datetime.now()
         self.last_used = datetime.now()
     
     def add_message(self, role, text):
-        """Adds a message to the session's history in the correct format."""
-        # The history format must be a list of dicts with 'role' and 'parts'.
         self.history.append({"role": role, "parts": [text]})
         self.last_used = datetime.now()
     
     def get_gemini_history(self):
-        """Returns the history formatted for the generate_content API call."""
         return self.history
 
 # --- Session Management ---
 def get_session(session_id=None):
-    """Retrieves an existing session or creates a new one."""
     if session_id and session_id in sessions:
         session = sessions[session_id]
         session.last_used = datetime.now()
         return session
     
-    # Create a new session if no ID is provided or if the ID is not found
     new_id = session_id or f"session_{uuid.uuid4()}"
     session = ChatSession(new_id)
     sessions[new_id] = session
@@ -88,63 +65,75 @@ def get_session(session_id=None):
 
 # --- Response Extraction ---
 def extract_response_text(response):
-    """Safely extracts text from the Gemini response, handling potential errors."""
     try:
-        # The .text attribute is the most direct way to get the output.
         return response.text
-    except ValueError:
-        # Fallback for cases where the response structure is unexpected
-        if response.candidates:
-            for candidate in response.candidates:
-                if candidate.content and candidate.content.parts:
-                    return "".join(part.text for part in candidate.content.parts)
     except Exception:
-        # Catch any other unforeseen errors.
-        pass
-    
-    # Check for safety blocking, which is a common reason for no response
-    if response.prompt_feedback and response.prompt_feedback.block_reason:
-        return f"Response blocked due to: {response.prompt_feedback.block_reason.name}"
-        
-    return "I'm sorry, I couldn't generate a response for that. Please try again."
+        # Fallback for safety or other issues
+        try:
+            if response.candidates:
+                return "".join(part.text for part in response.candidates[0].content.parts)
+            if response.prompt_feedback and response.prompt_feedback.block_reason:
+                return f"Response blocked due to: {response.prompt_feedback.block_reason.name}"
+        except Exception as e:
+            print(f"Error during response extraction: {e}")
+            return "I'm sorry, I encountered an error while generating a response."
+    return "I am unable to provide a response at this time."
 
-# --- UPDATED Chat Endpoint ---
-# This endpoint now uses the stateless `generate_content` method for reliability.
+
+# --- DEEPLY REVISED Chat Endpoint ---
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
     data = request.json
-    if not data:
-        return jsonify({"error": "Invalid JSON"}), 400
+    if not data or 'query' not in data:
+        return jsonify({"error": "Invalid request, missing 'query'"}), 400
         
     query = data.get('query')
     session_id = data.get('session_id')
     
-    if not query:
-        return jsonify({"error": "Missing 'query' parameter"}), 400
-    
     try:
         session = get_session(session_id)
         
-        # Add the user's new message to our manually managed history.
+        # 1. Add the user's clean message to the session history
         session.add_message("user", query)
         
-        # Define the generation config for THIS specific call to enforce the token limit.
+        # 2. Prepare the payload for the API call
+        # We create a temporary copy of the history to modify.
+        history_for_api = list(session.get_gemini_history())
+
+        # 3. REINFORCE THE PROMPT
+        # We add a new, forceful instruction at the end of the history.
+        # This makes it the last thing the model reads.
+        forceful_instruction = {
+            "role": "user",
+            "parts": [
+                f"Remember your instructions. Be extremely brief. "
+                f"STRICTLY 2-3 sentences or a few bullet points. "
+                f"Your response must be short."
+            ]
+        }
+        # We insert this instruction right before the user's actual last message.
+        # This frames the user's query with our rule.
+        history_for_api.insert(-1, forceful_instruction)
+
+
+        # 4. DEFINE A STRICTER GENERATION CONFIG
+        # We are adding a "stop" sequence. The model will stop generating if it
+        # tries to write a double newline, which typically separates paragraphs.
         generation_config = genai.GenerationConfig(
             max_output_tokens=MAX_RESPONSE_TOKENS,
-            # You can also set other parameters like temperature here if needed
-            # temperature=0.7 
+            stop_sequences=["\n\n"], # Stop if it tries to make a new paragraph
+            temperature=0.7 # A slightly lower temperature can reduce verbosity
         )
 
-        # Send the entire conversation history to the model on each turn.
-        # This stateless approach ensures rules are applied every time.
+        # 5. GENERATE CONTENT with the reinforced history and strict config
         response = model.generate_content(
-            session.get_gemini_history(),
+            history_for_api,
             generation_config=generation_config
         )
         
         answer = extract_response_text(response)
         
-        # Add the model's response to our history to maintain the conversation context.
+        # 6. Add only the clean model response to the persistent history
         session.add_message("model", answer)
         
         cleanup_old_sessions()
@@ -157,19 +146,17 @@ def chat_endpoint():
         })
     
     except Exception as e:
-        # Log the full error for easier debugging
-        print(f"An error occurred: {e}") 
+        print(f"An error occurred in chat_endpoint: {e}") 
         return jsonify({
             "error": "An internal error occurred. Please check the server logs.",
             "session_id": session_id
         }), 500
 
+
+# (The rest of the code for cleanup, delete, and info endpoints remains the same)
 # --- Session Cleanup ---
 def cleanup_old_sessions(max_age_seconds=3600, max_sessions=100):
-    """Cleans up old or excess chat sessions to manage memory."""
     now = datetime.now()
-    
-    # Remove sessions that haven't been used for more than max_age_seconds
     expired_keys = [
         sid for sid, session in sessions.items()
         if (now - session.last_used).total_seconds() > max_age_seconds
@@ -177,19 +164,15 @@ def cleanup_old_sessions(max_age_seconds=3600, max_sessions=100):
     for key in expired_keys:
         sessions.pop(key, None)
     
-    # If we still have too many sessions, remove the oldest ones
     if len(sessions) > max_sessions:
-        # Sort sessions by last_used time, oldest first
         sorted_sessions = sorted(sessions.items(), key=lambda item: item[1].last_used)
         num_to_remove = len(sessions) - max_sessions
         for i in range(num_to_remove):
             key_to_remove = sorted_sessions[i][0]
             sessions.pop(key_to_remove, None)
 
-# --- Other Endpoints ---
 @app.route('/session/<session_id>', methods=['DELETE'])
 def delete_session(session_id):
-    """Deletes a specific session."""
     if session_id in sessions:
         sessions.pop(session_id, None)
         return jsonify({"status": f"Session {session_id} deleted successfully"})
@@ -197,14 +180,11 @@ def delete_session(session_id):
 
 @app.route('/model-info', methods=['GET'])
 def model_info():
-    """Provides information about the currently configured model."""
     return jsonify({
         "model": MODEL_NAME,
         "system_prompt": SYSTEM_PROMPT,
         "max_response_tokens": MAX_RESPONSE_TOKENS
     })
 
-# --- Main Application Runner ---
 if __name__ == '__main__':
-    # Use debug=False in a production environment
     app.run(host='0.0.0.0', port=5000, debug=True)
