@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import google.generativeai as genai
-from flask_cors import CORS 
+from flask_cors import CORS
 import uuid
 import os
 import time
@@ -10,10 +10,13 @@ app = Flask(__name__)
 CORS(app)
 
 # --- Configuration ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_api_key_here") 
-MODEL_NAME = "gemini-1.5-flash"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_api_key_here")
+
+# UPDATED: The model name is confirmed as "gemini-2.5-flash" for the stable release.
+MODEL_NAME = "gemini-2.5-flash"
+
 # This now acts as a secondary, technical limit. The primary limit is in the prompt.
-MAX_RESPONSE_TOKENS = 250 
+MAX_RESPONSE_TOKENS = 250
 
 # The prompt template is now the primary method of control.
 PROMPT_TEMPLATE = """
@@ -28,7 +31,7 @@ You MUST reply in 2-3 short sentences or a few bullet points.
 """
 
 # --- Model Initialization ---
-# The model is initialized without a system_instruction.
+# The initialization method remains the same for the new model.
 genai.configure(api_key=GEMINI_API_KEY)
 
 model = genai.GenerativeModel(
@@ -50,11 +53,11 @@ class ChatSession:
         self.history = []
         self.created_at = datetime.now()
         self.last_used = datetime.now()
-    
+
     def add_message(self, role, text):
         self.history.append({"role": role, "parts": [text]})
         self.last_used = datetime.now()
-    
+
     def get_gemini_history(self):
         return self.history
 
@@ -64,7 +67,7 @@ def get_session(session_id=None):
         session = sessions[session_id]
         session.last_used = datetime.now()
         return session
-    
+
     new_id = session_id or f"session_{uuid.uuid4()}"
     session = ChatSession(new_id)
     sessions[new_id] = session
@@ -91,55 +94,60 @@ def chat_endpoint():
     data = request.json
     if not data or 'query' not in data:
         return jsonify({"error": "Invalid request, missing 'query'"}), 400
-        
+
     query = data.get('query')
     session_id = data.get('session_id')
-    
+
     try:
         session = get_session(session_id)
-        
+
         # Construct the final prompt by merging the template and the user's query.
         final_prompt_for_api = PROMPT_TEMPLATE.format(user_query=query)
 
         # Add the original, clean user query to the history.
         session.add_message("user", query)
-        
+
         history_for_api = list(session.get_gemini_history())
 
         # Replace the last user message with our combined, forceful prompt for the API call.
         history_for_api[-1]['parts'] = [final_prompt_for_api]
 
         # Define generation config as a technical safeguard.
+        # NEW: Added optional "thinking_config" for Gemini 2.5 Flash.
+        # This allows the model to spend more time on complex prompts to improve accuracy.
+        # You can adjust the budget (0 to 24576) or remove this config entirely.
         generation_config = genai.GenerationConfig(
             max_output_tokens=MAX_RESPONSE_TOKENS,
-            temperature=0.7
+            temperature=0.7,
+            # thinking_config=genai.types.ThinkingConfig(
+            #     thinking_budget=1024  # Example budget, can be adjusted
+            # )
         )
 
-        # Generate the response using the modified history.
+        # The method to generate content remains the same.
         response = model.generate_content(
             history_for_api,
             generation_config=generation_config
         )
-        
+
         answer = extract_response_text(response)
-        
+
         # Add the clean model response to the persistent session history.
         session.add_message("model", answer)
-        
+
         cleanup_old_sessions()
-        
-        # *** MODIFICATION IS HERE ***
+
         # The original 'query' is now included in the JSON response.
         return jsonify({
-            "query": query, # Added this line
+            "query": query,
             "response": answer,
             "session_id": session.id,
             "model": MODEL_NAME,
             "history_length": len(session.history)
         })
-    
+
     except Exception as e:
-        print(f"An error occurred in chat_endpoint: {e}") 
+        print(f"An error occurred in chat_endpoint: {e}")
         return jsonify({
             "error": "An internal error occurred. Please check the server logs.",
             "session_id": session_id
@@ -151,7 +159,7 @@ def cleanup_old_sessions(max_age_seconds=3600, max_sessions=100):
     expired_keys = [sid for sid, session in sessions.items() if (now - session.last_used).total_seconds() > max_age_seconds]
     for key in expired_keys:
         sessions.pop(key, None)
-    
+
     if len(sessions) > max_sessions:
         sorted_sessions = sorted(sessions.items(), key=lambda item: item[1].last_used)
         num_to_remove = len(sessions) - max_sessions
@@ -171,7 +179,8 @@ def model_info():
     return jsonify({
         "model": MODEL_NAME,
         "prompting_strategy": "Instructions are merged with the user query on each turn.",
-        "max_response_tokens_safeguard": MAX_RESPONSE_TOKENS
+        "max_response_tokens_safeguard": MAX_RESPONSE_TOKENS,
+        "thinking_feature": "Available but not enabled by default in this code. See comments in chat_endpoint."
     })
 
 if __name__ == '__main__':
