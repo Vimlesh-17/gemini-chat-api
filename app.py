@@ -11,20 +11,30 @@ CORS(app)
 
 # --- Configuration ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your_api_key_here") 
-MODEL_NAME = "gemini-1.5-flash" 
-MAX_RESPONSE_TOKENS = 80 # Lowered slightly to be even more strict
+MODEL_NAME = "gemini-1.5-flash"
+# This now acts as a secondary, technical limit. The primary limit is in the prompt.
+MAX_RESPONSE_TOKENS = 250 
 
-# The system prompt that defines the AI's persona and rules.
-SYSTEM_PROMPT = """
-You are a mature, non-judgmental friend/Psychologist for teenagers. Provide helpful, honest advice on any topic while maintaining appropriate boundaries. Strictly reply in 2 to 3 sentences or bullet points no more than that!.
+# We will now embed the prompt directly into each query.
+# The SYSTEM_PROMPT variable is no longer used for model initialization.
+PROMPT_TEMPLATE = """
+**INSTRUCTIONS:**
+You are a mature, non-judgmental friend/Psychologist for teenagers.
+Provide helpful, honest advice on the user's question below.
+Your response MUST be very concise and strictly limited to under 150 words.
+You MUST reply in 2-3 short sentences or a few bullet points.
+
+**USER'S QUESTION:**
+"{user_query}"
 """
 
 # --- Model Initialization ---
+# The model is now initialized WITHOUT a system_instruction.
 genai.configure(api_key=GEMINI_API_KEY)
 
 model = genai.GenerativeModel(
     MODEL_NAME,
-    system_instruction=SYSTEM_PROMPT,
+    # The system_instruction parameter has been removed.
     safety_settings={
         'HATE': 'BLOCK_NONE',
         'HARASSMENT': 'BLOCK_NONE',
@@ -33,10 +43,9 @@ model = genai.GenerativeModel(
     }
 )
 
-# --- In-Memory Session Storage ---
+# --- In-Memory Session Storage & Session Class ---
 sessions = {}
 
-# --- ChatSession Class ---
 class ChatSession:
     def __init__(self, session_id):
         self.id = session_id
@@ -49,6 +58,9 @@ class ChatSession:
         self.last_used = datetime.now()
     
     def get_gemini_history(self):
+        # We now need to ensure the history sent to the API is structured correctly,
+        # especially for the first message which won't have a model response yet.
+        # The generate_content function handles this well.
         return self.history
 
 # --- Session Management ---
@@ -68,7 +80,6 @@ def extract_response_text(response):
     try:
         return response.text
     except Exception:
-        # Fallback for safety or other issues
         try:
             if response.candidates:
                 return "".join(part.text for part in response.candidates[0].content.parts)
@@ -79,8 +90,7 @@ def extract_response_text(response):
             return "I'm sorry, I encountered an error while generating a response."
     return "I am unable to provide a response at this time."
 
-
-# --- DEEPLY REVISED Chat Endpoint ---
+# --- HEAVILY REVISED Chat Endpoint ---
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
     data = request.json
@@ -93,39 +103,30 @@ def chat_endpoint():
     try:
         session = get_session(session_id)
         
-        # 1. Add the user's clean message to the session history
+        # 1. CONSTRUCT THE FINAL PROMPT
+        # We merge our instructions and the user's query into a single prompt.
+        final_prompt_for_api = PROMPT_TEMPLATE.format(user_query=query)
+
+        # 2. ADD CLEAN MESSAGES TO HISTORY
+        # We add the *original* user query to the history for a clean conversation log.
         session.add_message("user", query)
         
-        # 2. Prepare the payload for the API call
-        # We create a temporary copy of the history to modify.
+        # We create a temporary history copy to send to the API.
         history_for_api = list(session.get_gemini_history())
 
-        # 3. REINFORCE THE PROMPT
-        # We add a new, forceful instruction at the end of the history.
-        # This makes it the last thing the model reads.
-        forceful_instruction = {
-            "role": "user",
-            "parts": [
-                f"Remember your instructions. Be extremely brief. "
-                f"STRICTLY 2-3 sentences or a few bullet points. "
-                f"Your response must be short."
-            ]
-        }
-        # We insert this instruction right before the user's actual last message.
-        # This frames the user's query with our rule.
-        history_for_api.insert(-1, forceful_instruction)
+        # Now, we REPLACE the last user message with our combined, forceful prompt.
+        # This ensures the API sees the instructions for the current turn.
+        history_for_api[-1]['parts'] = [final_prompt_for_api]
 
-
-        # 4. DEFINE A STRICTER GENERATION CONFIG
-        # We are adding a "stop" sequence. The model will stop generating if it
-        # tries to write a double newline, which typically separates paragraphs.
+        # 3. DEFINE GENERATION CONFIG
+        # This acts as a final technical safeguard.
         generation_config = genai.GenerationConfig(
             max_output_tokens=MAX_RESPONSE_TOKENS,
-            stop_sequences=["\n\n"], # Stop if it tries to make a new paragraph
-            temperature=0.7 # A slightly lower temperature can reduce verbosity
+            temperature=0.7
         )
 
-        # 5. GENERATE CONTENT with the reinforced history and strict config
+        # 4. GENERATE CONTENT
+        # We send the modified history to the model.
         response = model.generate_content(
             history_for_api,
             generation_config=generation_config
@@ -133,7 +134,8 @@ def chat_endpoint():
         
         answer = extract_response_text(response)
         
-        # 6. Add only the clean model response to the persistent history
+        # 5. ADD CLEAN RESPONSE TO HISTORY
+        # We add only the model's actual answer to our persistent session history.
         session.add_message("model", answer)
         
         cleanup_old_sessions()
@@ -152,15 +154,10 @@ def chat_endpoint():
             "session_id": session_id
         }), 500
 
-
-# (The rest of the code for cleanup, delete, and info endpoints remains the same)
-# --- Session Cleanup ---
+# --- Cleanup and Other Endpoints (Unchanged) ---
 def cleanup_old_sessions(max_age_seconds=3600, max_sessions=100):
     now = datetime.now()
-    expired_keys = [
-        sid for sid, session in sessions.items()
-        if (now - session.last_used).total_seconds() > max_age_seconds
-    ]
+    expired_keys = [sid for sid, session in sessions.items() if (now - session.last_used).total_seconds() > max_age_seconds]
     for key in expired_keys:
         sessions.pop(key, None)
     
@@ -182,8 +179,8 @@ def delete_session(session_id):
 def model_info():
     return jsonify({
         "model": MODEL_NAME,
-        "system_prompt": SYSTEM_PROMPT,
-        "max_response_tokens": MAX_RESPONSE_TOKENS
+        "prompting_strategy": "Instructions are merged with the user query on each turn.",
+        "max_response_tokens_safeguard": MAX_RESPONSE_TOKENS
     })
 
 if __name__ == '__main__':
